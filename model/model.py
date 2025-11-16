@@ -1,19 +1,21 @@
 """
-XGBoost Stock Return Model + Backtesting (R2-Optimised)
+XGBoost Stock Return Model + Backtesting (R2-Optimised + Sector/Cap Filters)
 
 Pipeline:
-1. Load precomputed indicators from MongoDB (stockDB.precomputed_daily)
-2. Normalize technical indicators PER SYMBOL
-3. Create FUTURE 120-day return label per stock (FwdReturn_120d)
-4. Build MARKET-NEUTRAL + SMOOTHED target for regression
-5. Add extra alpha factors (momentum, volume change, 52W-high distance)
-6. Clean data (remove penny stocks, zero-volume, old regime)
-7. Train XGBoost regression model on smoothed, market-neutral target
-8. Evaluate on held-out time-based test set (MSE / MAE / R2 / Direction Accuracy)
-9. Backtest: every 120 days, pick top-K predicted stocks and simulate portfolio
-10. Plot Actual vs Predicted portfolio value
-
-Author: (your name)
+1. Load sector + market-cap info from CSV (NSE.csv)
+2. Filter list of symbols by chosen sectors + cap categories
+3. Map CSV SYMBOL_NAME -> MongoDB symbol (full company name)
+4. Load precomputed indicators for ONLY those companies from MongoDB (stockDB.precomputed_daily)
+5. Normalize technical indicators PER SYMBOL (ticker)
+6. Create FUTURE 120-day return label per stock (FwdReturn_120d)
+7. Build MARKET-NEUTRAL + SMOOTHED target for regression (median smoothing + quantile clipping)
+8. Add extra alpha factors (lagged returns, momentum, rolling vol/volume, ranks)
+9. Clean data (remove penny stocks, zero-volume, old regime)
+10. Train XGBoost regression model on smoothed, market-neutral target
+11. Evaluate on held-out time-based test set (MSE / MAE / R2 / Direction Accuracy)
+12. Backtest: every 120 days, pick top-K predicted stocks and simulate portfolio
+13. Compute top-N stocks for latest date (highest predicted forward return)
+14. Plot Actual vs Predicted portfolio value
 """
 
 import os
@@ -41,12 +43,17 @@ def get_mongo_client(uri: str = "mongodb://localhost:27017") -> MongoClient:
 
 def fetch_precomputed_for_symbol(
     client: MongoClient,
-    symbol: str,
+    mongo_symbol_name: str,
     db: str = "stockDB",
     coll: str = "precomputed_daily",
 ) -> pd.DataFrame:
-    """Fetch all precomputed rows for a symbol from Mongo and sort by date."""
-    c = client[db][coll].find({"symbol": symbol})
+    """
+    Fetch all precomputed rows for a company from Mongo and sort by date.
+
+    NOTE: mongo_symbol_name is the FULL COMPANY NAME
+    as it appears in Mongo's 'symbol' field, e.g. 'FACT LTD'.
+    """
+    c = client[db][coll].find({"symbol": mongo_symbol_name})
     df = pd.DataFrame(list(c))
     if df.empty:
         return df
@@ -99,7 +106,7 @@ def train_xgb_regressor(
     X_valid: np.ndarray = None,
     y_valid: np.ndarray = None,
     params: Dict = None,
-    num_boost_round: int = 900,
+    num_boost_round: int = 1200,
 ) -> xgb.XGBRegressor:
     """
     Train XGBoost regressor with stronger capacity + regularisation.
@@ -110,10 +117,10 @@ def train_xgb_regressor(
             "n_estimators": num_boost_round,
             "max_depth": 6,
             "learning_rate": 0.03,
-            "subsample": 0.7,
-            "colsample_bytree": 0.7,
+            "subsample": 0.8,
+            "colsample_bytree": 0.8,
             "min_child_weight": 2,
-            "reg_lambda": 4.0,      # L2 regularisation
+            "reg_lambda": 5.0,      # L2 regularisation
             "reg_alpha": 1.0,       # L1 regularisation
             "objective": "reg:squarederror",
             "random_state": 42,
@@ -206,7 +213,7 @@ def backtest_model(
         predicted_growth = selected["pred_return"].mean()
         capital_pred = capital_pred * (1 + predicted_growth)
 
-        # Actual portfolio evolution using REAL future return from label_col
+        # Actual portfolio evolution using REAL forward return from label_col
         actual_growth = selected[label_col].mean()
         capital_actual = capital_actual * (1 + actual_growth)
 
@@ -229,7 +236,69 @@ def plot_backtest(portfolio_actual: List[float], portfolio_predicted: List[float
 
 
 # =====================================================
-# 4. FULL PIPELINE (LOAD + TRAIN + BACKTEST)
+# 4. NSE Sector/Cap helpers + Top stocks
+# =====================================================
+
+def load_and_filter_nse_list(
+    csv_path: str = "NSE.csv",
+    allowed_sectors: List[str] = None,
+    allowed_caps: List[str] = None,
+) -> pd.DataFrame:
+    """
+    Load NSE symbol list with sector + cap info and filter.
+
+    Returns a FILTERED DATAFRAME with at least:
+    - symbol       (ticker)
+    - SYMBOL_NAME  (full name matching Mongo 'symbol')
+    - sector
+    - cap_category
+    """
+    df = pd.read_csv(csv_path)
+
+    required_cols = ["symbol", "SYMBOL_NAME", "sector", "cap_category"]
+    for col in required_cols:
+        if col not in df.columns:
+            raise ValueError(f"CSV must contain '{col}' column")
+
+    df["sector"] = df["sector"].fillna("UNKNOWN").astype(str)
+    df["cap_category"] = df["cap_category"].fillna("UNKNOWN").astype(str)
+    df["symbol"] = df["symbol"].astype(str)
+    df["SYMBOL_NAME"] = df["SYMBOL_NAME"].astype(str)
+
+    print("\n🔍 CSV unique sectors:", df["sector"].unique())
+    print("🔍 CSV unique cap categories:", df["cap_category"].unique())
+
+    if allowed_sectors:
+        df = df[df["sector"].isin(allowed_sectors)]
+
+    if allowed_caps:
+        df = df[df["cap_category"].isin(allowed_caps)]
+
+    return df[["symbol", "SYMBOL_NAME", "sector", "cap_category"]]
+
+
+def get_top_predicted_stocks(
+    df_predicted: pd.DataFrame,
+    top_n: int = 10,
+    latest_only: bool = True,
+) -> pd.DataFrame:
+    """
+    Returns top_n stocks with highest predicted forward return.
+
+    If latest_only=True, only considers the latest date in df_predicted.
+    """
+    df = df_predicted.copy()
+
+    if latest_only:
+        last_date = df["date"].max()
+        df = df[df["date"] == last_date]
+
+    df_sorted = df.sort_values("pred_return_fwd", ascending=False)
+    return df_sorted.head(top_n)[["date", "symbol", "close", "pred_return_fwd"]]
+
+
+# =====================================================
+# 5. FULL PIPELINE (LOAD + TRAIN + BACKTEST)
 # =====================================================
 
 def example_run():
@@ -264,39 +333,78 @@ def example_run():
         "VWAP_Distance",
     ]
 
-    # -----------------------------
-    # 4.1 Load all symbols' data
-    # -----------------------------
-    symbols = client[DB][COLL].distinct("symbol")
-    print(f"Found total {len(symbols)} symbols in DB.")
+    # --------------------------------------------------
+    # 5.1 Select companies based on sector + cap filters
+    # --------------------------------------------------
+    # Adjust these as needed
+    allowed_sectors = ["Basic Materials"]
+    allowed_caps = ["LARGE_CAP"]
 
-    # Limit for speed (tune as needed)
-    symbols = symbols[:500]
-    print(f"Using first {len(symbols)} symbols only.")
+    filtered_df = load_and_filter_nse_list(
+        csv_path="NSE.csv",
+        allowed_sectors=allowed_sectors,
+        allowed_caps=allowed_caps,
+    )
 
+    filtered_symbols = filtered_df["symbol"].tolist()
+    print("\n================ SYMBOL FILTER ================")
+    print("Allowed sectors   :", allowed_sectors if allowed_sectors else "ALL")
+    print("Allowed cap groups:", allowed_caps if allowed_caps else "ALL")
+    print("Filtered symbols  :", len(filtered_symbols))
+    print("Sample symbols    :", filtered_symbols[:10])
+    print("================================================\n")
+
+    if filtered_df.empty:
+        print("No symbols matched the sector/cap filters. Exiting.")
+        return
+
+    # --------------------------------------------------
+    # 5.2 Load those companies' data from Mongo
+    #     Match by SYMBOL_NAME (full company name)
+    # --------------------------------------------------
     dfs = []
-    for sym in symbols:
-        df = fetch_precomputed_for_symbol(client, sym, DB, COLL)
-        if df.empty:
+    not_found = []
+
+    for _, row in filtered_df.iterrows():
+        ticker = row["symbol"]           # e.g. FACT
+        full_name = row["SYMBOL_NAME"]   # e.g. FACT LTD
+
+        print(f"🔎 Fetching from Mongo for: {ticker} - {full_name}")
+        df_sym = fetch_precomputed_for_symbol(client, full_name, DB, COLL)
+
+        if df_sym.empty:
+            print("   ❌ Not found in MongoDB")
+            not_found.append(ticker)
             continue
-        df["symbol"] = sym
-        dfs.append(df)
+
+        # Overwrite / attach ticker as the 'symbol' used in the model
+        df_sym["symbol"] = ticker
+        dfs.append(df_sym)
+        print(f"   ✅ Found {len(df_sym)} rows")
 
     if not dfs:
-        print("No data found in DB.")
+        print("\n❌ No data found in MongoDB for any of the filtered companies. Exiting.")
         return
 
     full_df = pd.concat(dfs).reset_index(drop=True)
     full_df = full_df.sort_values(["date", "symbol"]).reset_index(drop=True)
-    print("Full combined dataset:", full_df.shape)
+
+    # Stats
+    print(f"\n📊 Total filtered companies       : {len(filtered_df)}")
+    print(f"✅ Companies found in MongoDB     : {full_df['symbol'].nunique()}")
+    print(f"❌ Companies missing in MongoDB   : {len(not_found)}")
+    if not_found:
+        print("   Missing tickers (first 20):", not_found[:20])
+    print(f"📈 Total historical rows loaded   : {len(full_df):,}")
+    print("Full combined dataset (after symbol filter):", full_df.shape)
 
     # --------------------------------------------------
-    # 4.2 Filter out very old data (regime shifts)
+    # 5.3 Filter out very old data (regime shifts)
     # --------------------------------------------------
     full_df = full_df[full_df["date"] >= pd.Timestamp("2018-01-01")].reset_index(drop=True)
 
     # --------------------------------------------------
-    # 4.3 Remove days with no volume & penny stocks
+    # 5.4 Remove days with no volume & penny stocks
     # --------------------------------------------------
     if "volume" in full_df.columns:
         full_df = full_df[full_df["volume"] > 0]
@@ -305,7 +413,7 @@ def example_run():
     full_df = full_df[full_df["close"] > 50].reset_index(drop=True)
 
     # --------------------------------------------------
-    # 4.4 Normalize features PER SYMBOL (base indicators)
+    # 5.5 Normalize base indicators PER SYMBOL (ticker)
     # --------------------------------------------------
     for col in base_feature_cols:
         if col in full_df.columns:
@@ -314,15 +422,21 @@ def example_run():
             )
 
     # --------------------------------------------------
-    # 4.5 Add additional predictive alpha factors
+    # 5.6 Add additional predictive alpha factors
     # --------------------------------------------------
+    # Raw 1-day returns (for rolling stats)
+    full_df["Ret_1d_raw"] = full_df.groupby("symbol")["close"].pct_change()
 
-    # 120-day momentum (price change over 120 days)
+    # 60-day momentum (from price)
     full_df["Momentum_60"] = full_df.groupby("symbol")["close"].pct_change(60)
 
     # Volume % change (volume shock)
     if "volume" in full_df.columns:
         full_df["Vol_Change"] = full_df.groupby("symbol")["volume"].pct_change()
+        full_df["Volume_RollMean_20"] = (
+            full_df.groupby("symbol")["volume"]
+            .transform(lambda x: x.rolling(20, min_periods=10).mean())
+        )
 
     # Distance from 52-week high
     full_df["High_252"] = full_df.groupby("symbol")["close"].transform(
@@ -330,8 +444,14 @@ def example_run():
     )
     full_df["Pct_From_52W_High"] = full_df["close"] / full_df["High_252"] - 1
 
+    # Rolling volatility of daily returns
+    full_df["Volatility_60_extra"] = (
+        full_df.groupby("symbol")["Ret_1d_raw"]
+        .transform(lambda x: x.rolling(60, min_periods=20).std())
+    )
+
     # --------------------------------------------------
-    # 4.6 Create FUTURE HORIZON-day return + market-neutral + smoothing
+    # 5.7 Create FUTURE HORIZON-day return + market-neutral + smoothing
     # --------------------------------------------------
     fwd_col = f"FwdReturn_{HORIZON}d"
 
@@ -358,26 +478,58 @@ def example_run():
         full_df[fwd_col] - full_df[f"MktFwdReturn_{HORIZON}d"]
     )
 
-    # Smooth the target with a rolling window (per symbol)
+    # Smooth the target with a rolling window (median, per symbol)
     full_df["FwdReturn_smoothed"] = full_df.groupby("symbol")["FwdReturn_mkt_neutral"].transform(
-        lambda x: x.rolling(5, min_periods=1).mean()
+        lambda x: x.rolling(5, min_periods=1).median()
     )
 
-    # Clip extreme values for training stability
-    full_df["Target"] = full_df["FwdReturn_smoothed"].clip(-0.30, 0.30)
+    # Quantile clipping of the smoothed target (instead of fixed ±0.30)
+    valid_target = full_df["FwdReturn_smoothed"].dropna()
+    if len(valid_target) > 0:
+        lower_q = valid_target.quantile(0.01)
+        upper_q = valid_target.quantile(0.99)
+    else:
+        lower_q, upper_q = -0.30, 0.30
+
+    full_df["Target"] = full_df["FwdReturn_smoothed"].clip(lower_q, upper_q)
 
     # --------------------------------------------------
-    # 4.7 Smooth noisy indicators (optional, helps stability)
+    # 5.8 Smooth noisy indicators (optional, helps stability)
     # --------------------------------------------------
     smooth_list = ["RSI", "MACD", "Volatility_20"]
     for col in smooth_list:
         if col in full_df.columns:
             full_df[col + "_smoothed"] = full_df.groupby("symbol")[col].transform(
-                lambda x: x.rolling(5, min_periods=1).mean()
+                lambda x: x.rolling(5, min_periods=1).median()
             )
 
     # --------------------------------------------------
-    # 4.8 Final feature columns (only those that exist)
+    # 5.9 Lag features (to avoid look-ahead, add memory)
+    # --------------------------------------------------
+    lag_defs = {
+        "Return_1d": "Return_1d_lag1",
+        "Return_5d": "Return_5d_lag1",
+        "Momentum_20": "Momentum_20_lag1",
+        "RSI": "RSI_lag1",
+        "MACD": "MACD_lag1",
+    }
+
+    for src_col, lag_col in lag_defs.items():
+        if src_col in full_df.columns:
+            full_df[lag_col] = full_df.groupby("symbol")[src_col].shift(1)
+
+    # --------------------------------------------------
+    # 5.10 Cross-sectional ranks (per date)
+    # --------------------------------------------------
+    if "RSI" in full_df.columns:
+        full_df["RSI_rank"] = full_df.groupby("date")["RSI"].rank(pct=True)
+    if "Momentum_60" in full_df.columns:
+        full_df["Momentum_60_rank"] = full_df.groupby("date")["Momentum_60"].rank(pct=True)
+    if "Volatility_20" in full_df.columns:
+        full_df["Volatility_20_rank"] = full_df.groupby("date")["Volatility_20"].rank(pct=True)
+
+    # --------------------------------------------------
+    # 5.11 Final feature columns (only those that exist)
     # --------------------------------------------------
     extra_features = [
         "Momentum_60",
@@ -386,18 +538,28 @@ def example_run():
         "RSI_smoothed",
         "MACD_smoothed",
         "Volatility_20_smoothed",
+        "Volatility_60_extra",
+        "Volume_RollMean_20",
+        "Return_1d_lag1",
+        "Return_5d_lag1",
+        "Momentum_20_lag1",
+        "RSI_lag1",
+        "MACD_lag1",
+        "RSI_rank",
+        "Momentum_60_rank",
+        "Volatility_20_rank",
     ]
     available_cols = set(full_df.columns)
     feature_cols = [c for c in base_feature_cols + extra_features if c in available_cols]
 
-    print("Using feature columns:")
+    print("\nUsing feature columns:")
     for c in feature_cols:
         print(" -", c)
 
-    LABEL_COL = "Target"  # smoothed, market-neutral label for training
+    LABEL_COL = "Target"
 
     # --------------------------------------------------
-    # 4.9 Train/test split (time-based)
+    # 5.12 Train/test split (time-based)
     # --------------------------------------------------
     X_train, X_test, y_train, y_test, dates_test = prepare_dataset(
         full_df, LABEL_COL, feature_cols
@@ -412,11 +574,11 @@ def example_run():
         y_train,
         X_valid=X_test_s,
         y_valid=y_test,
-        num_boost_round=900,
+        num_boost_round=1200,
     )
 
     # --------------------------------------------------
-    # 4.10 Evaluation
+    # 5.13 Evaluation
     # --------------------------------------------------
     y_pred = model.predict(X_test_s)
     print("\nEvaluation on held-out test set (Target = smoothed, market-neutral):")
@@ -424,23 +586,31 @@ def example_run():
     print("MAE:", mean_absolute_error(y_test, y_pred))
     print("R2 :", r2_score(y_test, y_pred))
 
-    # Directional accuracy (UP/DOWN) on the target
     pred_up = y_pred > 0
     true_up = y_test > 0
     direction_acc = (pred_up == true_up).mean()
     print("Direction Accuracy (%):", direction_acc * 100.0)
 
     # --------------------------------------------------
-    # 4.11 Save model & scaler
+    # 5.14 Save model & scaler
     # --------------------------------------------------
     joblib.dump(model, "xgb_fwd_return_model.joblib")
     joblib.dump(scaler, "xgb_fwd_return_scaler.joblib")
     print("\n✅ Model + scaler saved to disk.\n")
 
     # --------------------------------------------------
-    # 4.12 Backtest (portfolio simulation)
+    # 5.15 Predict on full_df and show BEST stocks now
     # --------------------------------------------------
-    print("Running Backtest...")
+    df_pred_all = predict_returns(model, scaler, full_df, feature_cols)
+
+    print("\n📈 TOP 10 PREDICTED STOCKS (latest date):")
+    best_now = get_top_predicted_stocks(df_pred_all, top_n=10, latest_only=True)
+    print(best_now.to_string(index=False))
+
+    # --------------------------------------------------
+    # 5.16 Backtest (portfolio simulation)
+    # --------------------------------------------------
+    print("\nRunning Backtest...")
 
     actual_vals, predicted_vals = backtest_model(
         full_df,
